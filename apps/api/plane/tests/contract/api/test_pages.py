@@ -4,23 +4,27 @@
 
 import json
 from unittest import mock
+from uuid import uuid4
 
 import pytest
 from rest_framework import status
 from rest_framework.test import APIClient
 
+from plane.api.rate_limit import ApiKeyRateThrottle
 from plane.db.models import Page, Project, ProjectMember, ProjectPage, User, WorkspaceMember
 from plane.db.models.api import APIToken
 
 
 @pytest.fixture(autouse=True)
 def background_calls():
-    """Keep page tests away from celery, redis and the force-close wait"""
+    """Keep page tests away from celery, redis, the force-close wait and the
+    shared API key rate limit (other contract tests use the same token)"""
     with (
         mock.patch("plane.api.views.page.page_transaction") as page_transaction,
         mock.patch("plane.api.views.page.track_page_version") as track_page_version,
         mock.patch("plane.api.views.page.redis_instance") as redis_instance,
         mock.patch("plane.api.views.page.time.sleep"),
+        mock.patch.object(ApiKeyRateThrottle, "allow_request", return_value=True),
     ):
         yield {
             "page_transaction": page_transaction,
@@ -55,7 +59,8 @@ def other_project(db, workspace, create_user):
 
 @pytest.fixture
 def member_user(db, workspace, project):
-    user = User.objects.create(email="member@plane.so", first_name="Member", last_name="User")
+    unique_id = uuid4().hex[:8]
+    user = User.objects.create(email=f"member-{unique_id}@plane.so", username=f"member_{unique_id}")
     WorkspaceMember.objects.create(workspace=workspace, member=user, role=15)
     ProjectMember.objects.create(project=project, member=user, role=15, is_active=True)
     return user
@@ -162,7 +167,7 @@ class TestPageListCreateAPIEndpoint:
         response = api_key_client.get(pages_url(workspace.slug, project.id))
 
         assert response.status_code == status.HTTP_200_OK
-        assert [page["id"] for page in response.data["results"]] == [str(active.id)]
+        assert [str(page["id"]) for page in response.data["results"]] == [str(active.id)]
 
     @pytest.mark.django_db
     def test_list_archived_pages(self, api_key_client, workspace, project, create_user):
@@ -172,7 +177,7 @@ class TestPageListCreateAPIEndpoint:
         response = api_key_client.get(pages_url(workspace.slug, project.id), {"archived": "true"})
 
         assert response.status_code == status.HTTP_200_OK
-        assert [page["id"] for page in response.data["results"]] == [str(archived.id)]
+        assert [str(page["id"]) for page in response.data["results"]] == [str(archived.id)]
 
     @pytest.mark.django_db
     def test_non_member_cannot_list(self, member_client, workspace, other_project):
