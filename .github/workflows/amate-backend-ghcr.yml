@@ -1,0 +1,83 @@
+# Builds the backend image used by the amate.id self-hosted Plane, which runs
+# upstream releases plus the patches on the amate/* branches (e.g. the public
+# Pages API). The image replaces makeplane/plane-backend for the api, worker,
+# beat-worker and migrator services.
+name: Amate backend image (GHCR)
+
+on:
+  push:
+    branches:
+      - "amate/**"
+    tags:
+      - "amate-v*"
+    paths:
+      - "apps/api/**"
+      - "docker-compose-test.yml"
+      - "docker-compose-test.amate.yml"
+      - ".github/workflows/amate-backend-ghcr.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: amate-backend-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: API tests
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      # Only the API env is needed; setup.sh would also install the whole JS monorepo
+      - name: Create API env file
+        run: |
+          cp apps/api/.env.example apps/api/.env
+          echo "SECRET_KEY=\"$(openssl rand -hex 25)\"" >> apps/api/.env
+
+      - name: Run API unit and contract tests
+        run: >
+          docker compose -f docker-compose-test.yml -f docker-compose-test.amate.yml run --rm --build api-tests
+          pytest plane/tests/unit plane/tests/contract/api -p no:cacheprovider
+
+      - name: Tear down
+        if: always()
+        run: docker compose -f docker-compose-test.yml -f docker-compose-test.amate.yml down -v
+
+  build:
+    name: Build and push plane-backend
+    needs: test
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository_owner }}/plane-backend
+          tags: |
+            type=ref,event=branch
+            type=ref,event=tag
+            type=sha,prefix=sha-
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: ./apps/api
+          file: ./apps/api/Dockerfile.api
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

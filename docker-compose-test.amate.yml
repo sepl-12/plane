@@ -1,0 +1,19 @@
+# Override for docker-compose-test.yml used by the amate backend workflow.
+#
+# minio/minio is no longer published on Docker Hub (or quay.io), so the test
+# stack cannot pull it. The API tests run here mock object storage, so MinIO is
+# replaced with an idle container that only satisfies the healthcheck.
+#
+#   docker compose -f docker-compose-test.yml -f docker-compose-test.amate.yml run --rm --build api-tests pytest ...
+
+services:
+  test-minio:
+    image: alpine:3.20
+    env_file: !reset []
+    environment: !reset {}
+    entrypoint: ["/bin/sh", "-c", "tail -f /dev/null"]
+    healthcheck:
+      test: ["CMD", "true"]
+      interval: 2s
+      timeout: 2s
+      retries: 3
