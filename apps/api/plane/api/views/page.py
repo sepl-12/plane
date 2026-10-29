@@ -4,7 +4,6 @@
 
 # Python imports
 import json
-import time
 
 # Django imports
 from django.core.serializers.json import DjangoJSONEncoder
@@ -24,8 +23,6 @@ from plane.app.views.page.base import unarchive_archive_page_and_descendants
 from plane.bgtasks.page_transaction_task import page_transaction
 from plane.bgtasks.page_version_task import track_page_version
 from plane.db.models import Page, Project, ProjectMember, UserFavorite, UserRecentVisit
-from plane.settings.redis import redis_instance
-from plane.utils.exception_logger import log_exception
 from plane.utils.openapi import (
     page_docs,
     CURSOR_PARAMETER,
@@ -39,12 +36,6 @@ from plane.utils.openapi import (
 )
 from .base import BaseAPIView
 
-# Channel the live (Hocuspocus) server listens on for admin commands.
-LIVE_ADMIN_CHANNEL = "hocuspocus:admin"
-# Give the live server a moment to drop its in-memory copy before the new
-# content is written, so an open editor does not save the old document back.
-LIVE_FORCE_CLOSE_GRACE_SECONDS = 0.3
-
 ARCHIVED_PARAMETER = OpenApiParameter(
     name="archived",
     type=OpenApiTypes.BOOL,
@@ -53,25 +44,12 @@ ARCHIVED_PARAMETER = OpenApiParameter(
     required=False,
 )
 
-
-def force_close_live_document(page_id):
-    """Ask every live server to close open editors of this page and unload it."""
-    try:
-        redis_instance().publish(
-            LIVE_ADMIN_CHANNEL,
-            json.dumps(
-                {
-                    "command": "force_close",
-                    "docId": str(page_id),
-                    "reason": "admin_request",
-                    "code": 4000,
-                    "originServer": "plane-api",
-                    "timestamp": timezone.now().isoformat(),
-                }
-            ),
-        )
-    except Exception as e:
-        log_exception(e)
+CONTENT_EDITED_IN_EDITOR_RESPONSE = OpenApiResponse(
+    description=(
+        "The page body cannot be replaced because the page has been opened in the editor. "
+        "Edit it in Plane, or create a new page."
+    )
+)
 
 
 def get_project_page(slug, project_id, page_id):
@@ -243,13 +221,15 @@ class PageDetailAPIEndpoint(BaseAPIView):
         operation_id="update_page",
         summary="Update page",
         description=(
-            "Update a page. Only the fields sent are changed; `description_html` replaces the whole body. "
+            "Update a page. Only the fields sent are changed; `description_html` replaces the whole body "
+            "and is only accepted while the page has never been opened in the editor. "
             "Locked or archived pages are refused, and only the owner can change `access`."
         ),
         request=OpenApiRequest(request=PageUpdateSerializer),
         responses={
             200: OpenApiResponse(description="Page updated", response=PageSerializer),
             400: INVALID_REQUEST_RESPONSE,
+            409: CONTENT_EDITED_IN_EDITOR_RESPONSE,
         },
     )
     def patch(self, request, slug, project_id, page_id):
@@ -269,6 +249,21 @@ class PageDetailAPIEndpoint(BaseAPIView):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
+        # Once the page has been opened, the live server owns the collaborative
+        # document. Browsers that still hold it keep saving their copy, which
+        # overwrites or duplicates a body replaced here, so refuse instead.
+        if "description_html" in request.data and page.description_binary:
+            return Response(
+                {
+                    "error": (
+                        "The page body cannot be replaced because the page has been opened in the editor. "
+                        "Edit it in Plane, or create a new page."
+                    ),
+                    "error_code": "PAGE_CONTENT_OWNED_BY_EDITOR",
+                },
+                status=status.HTTP_409_CONFLICT,
+            )
+
         serializer = PageUpdateSerializer(
             page,
             data=request.data,
@@ -280,9 +275,6 @@ class PageDetailAPIEndpoint(BaseAPIView):
 
         description_changed = "description_html" in serializer.validated_data
         old_description_html = page.description_html
-        if description_changed:
-            force_close_live_document(page.id)
-            time.sleep(LIVE_FORCE_CLOSE_GRACE_SECONDS)
 
         page = serializer.save()
 
@@ -344,7 +336,6 @@ class PageDetailAPIEndpoint(BaseAPIView):
             project_pages__deleted_at__isnull=True,
         ).update(parent=None)
 
-        force_close_live_document(page.id)
         page.delete()
 
         UserFavorite.objects.filter(

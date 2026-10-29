@@ -2,7 +2,6 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # See the LICENSE file for details.
 
-import json
 from unittest import mock
 from uuid import uuid4
 
@@ -17,19 +16,16 @@ from plane.db.models.api import APIToken
 
 @pytest.fixture(autouse=True)
 def background_calls():
-    """Keep page tests away from celery, redis, the force-close wait and the
-    shared API key rate limit (other contract tests use the same token)"""
+    """Keep page tests away from celery and the shared API key rate limit
+    (other contract tests use the same token)"""
     with (
         mock.patch("plane.api.views.page.page_transaction") as page_transaction,
         mock.patch("plane.api.views.page.track_page_version") as track_page_version,
-        mock.patch("plane.api.views.page.redis_instance") as redis_instance,
-        mock.patch("plane.api.views.page.time.sleep"),
         mock.patch.object(ApiKeyRateThrottle, "allow_request", return_value=True),
     ):
         yield {
             "page_transaction": page_transaction,
             "track_page_version": track_page_version,
-            "redis": redis_instance.return_value,
         }
 
 
@@ -208,10 +204,10 @@ class TestPageDetailAPIEndpoint:
         assert response.status_code == status.HTTP_403_FORBIDDEN
 
     @pytest.mark.django_db
-    def test_update_description_resets_document_and_closes_editors(
+    def test_update_description_of_unopened_page(
         self, api_key_client, workspace, project, create_user, background_calls
     ):
-        page = make_page(project, create_user, description_binary=b"old-yjs-state")
+        page = make_page(project, create_user)
 
         response = api_key_client.patch(
             page_url(workspace.slug, project.id, page.id),
@@ -223,13 +219,28 @@ class TestPageDetailAPIEndpoint:
         page.refresh_from_db()
         assert page.description_html == "<p>New body</p>"
         assert page.description_binary is None
-
-        channel, payload = background_calls["redis"].publish.call_args.args
-        assert channel == "hocuspocus:admin"
-        assert json.loads(payload)["command"] == "force_close"
-        assert json.loads(payload)["docId"] == str(page.id)
         background_calls["page_transaction"].delay.assert_called_once()
         background_calls["track_page_version"].delay.assert_called_once()
+
+    @pytest.mark.django_db
+    def test_update_description_of_opened_page_is_refused(
+        self, api_key_client, workspace, project, create_user, background_calls
+    ):
+        page = make_page(project, create_user, description_binary=b"live-yjs-state")
+
+        response = api_key_client.patch(
+            page_url(workspace.slug, project.id, page.id),
+            {"name": "Renamed too", "description_html": "<p>New body</p>"},
+            format="json",
+        )
+
+        assert response.status_code == status.HTTP_409_CONFLICT
+        assert response.data["error_code"] == "PAGE_CONTENT_OWNED_BY_EDITOR"
+        page.refresh_from_db()
+        assert page.name == "Existing page"
+        assert page.description_html == "<p>Old body</p>"
+        assert bytes(page.description_binary) == b"live-yjs-state"
+        background_calls["page_transaction"].delay.assert_not_called()
 
     @pytest.mark.django_db
     def test_rename_keeps_document(self, api_key_client, workspace, project, create_user, background_calls):
@@ -245,7 +256,6 @@ class TestPageDetailAPIEndpoint:
         page.refresh_from_db()
         assert page.name == "Renamed"
         assert bytes(page.description_binary) == b"old-yjs-state"
-        background_calls["redis"].publish.assert_not_called()
 
     @pytest.mark.django_db
     def test_locked_page_can_only_be_unlocked(self, api_key_client, workspace, project, create_user):
